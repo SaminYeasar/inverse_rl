@@ -40,7 +40,9 @@ class ImitationLearning(object, metaclass=Hyperparametrized):
             else:
                 raise NotImplementedError()
 
-        # compute path probs
+        ######################################
+        # (1) compute path probs
+        ######################################
         Npath = len(paths)
         actions = [path['actions'] for path in paths]
         if pol_dist_type == DIST_GAUSSIAN:
@@ -58,6 +60,9 @@ class ImitationLearning(object, metaclass=Hyperparametrized):
 
         return np.array(path_probs)
 
+    ###############################
+    # (2) for given s,a provides s',a'
+    ###############################
     @staticmethod
     def _insert_next_state(paths, pad_val=0.0):
         for path in paths:
@@ -71,6 +76,11 @@ class ImitationLearning(object, metaclass=Hyperparametrized):
             path['actions_next'] = nact
         return paths
 
+    ####################################################################
+    # (3)
+    # for given path takes (s,a)
+    # gives state, next_state, action, next_action, path_probability
+    ####################################################################
     @staticmethod
     def extract_paths(paths, keys=('observations', 'actions'), stack=True):
         if stack:
@@ -128,7 +138,7 @@ class TrajectoryIRL(ImitationLearning):
                 agent_infos.append(infos)
             agent_infos_stack = tensor_utils.stack_tensor_dict_list(agent_infos)
             for key in agent_infos_stack:
-                agent_infos_stack[key] = np.transpose(agent_infos_stack[key], axes=[1,0,2])
+                agent_infos_stack[key] = np.transpose(agent_infos_stack[key], axes=[1, 0, 2])
             agent_infos_transpose = tensor_utils.split_tensor_dict_list(agent_infos_stack)
             for i, path in enumerate(expert_paths):
                 path['agent_infos'] = agent_infos_transpose[i]
@@ -225,15 +235,25 @@ class GAIL(SingleTimestepIRL):
             self.step = tf.train.AdamOptimizer(learning_rate=self.lr).minimize(self.loss)
             self._make_param_ops(vs)
 
-
+    """
+    Takes sample from both "expert" and "generator"
+    feed it through discriminator
+    return discriminator loss
+    """
     def fit(self, trajs, batch_size=32, max_itrs=100, **kwargs):
+        # get expert state and action
         obs, acts = self.extract_paths(trajs)
         expert_obs, expert_acts = self.expert_trajs_extracted
 
         # Train discriminator
         for it in TrainingIterator(max_itrs, heartbeat=5):
+
+            # sample generator state and action:
             obs_batch, act_batch = self.sample_batch(obs, acts, batch_size=batch_size)
+            # sample expert state and action:
             expert_obs_batch, expert_act_batch = self.sample_batch(expert_obs, expert_acts, batch_size=batch_size)
+
+            # create input to feed into discriminator:
             labels = np.zeros((batch_size*2, 1))
             labels[batch_size:] = 1.0
             obs_batch = np.concatenate([obs_batch, expert_obs_batch], axis=0)
@@ -255,14 +275,14 @@ class GAIL(SingleTimestepIRL):
 
     def eval(self, paths, **kwargs):
         """
-        Return bonus
+        Return bonusenergy
         """
         obs, acts = self.extract_paths(paths)
         scores = tf.get_default_session().run(self.predictions,
                                               feed_dict={self.act_t: acts, self.obs_t: obs})
 
         # reward = log D(s, a)
-        scores = np.log(scores[:,0]+LOG_REG)
+        scores = np.log(scores[:, 0]+LOG_REG)
         return self.unpack(scores, paths)
 
 
@@ -290,12 +310,16 @@ class AIRLStateAction(SingleTimestepIRL):
             self.lprobs = tf.placeholder(tf.float32, [None, 1], name='log_probs')
             self.lr = tf.placeholder(tf.float32, (), name='lr')
 
+            # (s,a)
             obs_act = tf.concat([self.obs_t, self.act_t], axis=1)
             with tf.variable_scope('discrim') as dvs:
                 with tf.variable_scope('energy'):
                     self.energy = discrim_arch(obs_act, **discrim_arch_args)
                 # we do not learn a separate log Z(s) because it is impossible to separate from the energy
                 # In a discrete domain we can explicitly normalize to calculate log Z(s)
+
+                # f(s,a)
+                # "log_p_tau" is likelihood of a trajectory
                 log_p_tau = -self.energy
                 discrim_vars = tf.get_collection('reg_vars', scope=dvs.name)
 
@@ -370,10 +394,8 @@ class AIRLStateAction(SingleTimestepIRL):
         Return bonus
         """
         obs, acts = self.extract_paths(paths)
-
-        energy  = tf.get_default_session().run(self.energy,
-                                                    feed_dict={self.act_t: acts, self.obs_t: obs})
-        energy = -energy[:,0] 
+        energy = tf.get_default_session().run(self.energy, feed_dict={self.act_t: acts, self.obs_t: obs})
+        energy = -energy[:, 0]
         return self.unpack(energy, paths)
 
 
@@ -507,6 +529,6 @@ class GAN_GCL(TrajectoryIRL):
 
         scores = tf.get_default_session().run(self.energy,
                                           feed_dict={self.act_t: acts, self.obs_t: obs})
-        scores = -scores[:,:,0]
+        scores = -scores[:, :, 0]
         return scores
 

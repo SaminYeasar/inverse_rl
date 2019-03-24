@@ -52,36 +52,65 @@ class AIRL(SingleTimestepIRL):
         # build energy model
         with tf.variable_scope(name) as _vs:
             # Should be batch_size x T x dO/dU
-            self.obs_t = tf.placeholder(tf.float32, [None, self.dO], name='obs')
-            self.nobs_t = tf.placeholder(tf.float32, [None, self.dO], name='nobs')
-            self.act_t = tf.placeholder(tf.float32, [None, self.dU], name='act')
-            self.nact_t = tf.placeholder(tf.float32, [None, self.dU], name='nact')
+            self.obs_t = tf.placeholder(tf.float32, [None, self.dO], name='state/obs')
+            self.nobs_t = tf.placeholder(tf.float32, [None, self.dO], name='next_state/nobs')
+            self.act_t = tf.placeholder(tf.float32, [None, self.dU], name='action/act')
+            self.nact_t = tf.placeholder(tf.float32, [None, self.dU], name='next_action/nact')
             self.labels = tf.placeholder(tf.float32, [None, 1], name='labels')
             self.lprobs = tf.placeholder(tf.float32, [None, 1], name='log_probs')
             self.lr = tf.placeholder(tf.float32, (), name='lr')
 
             with tf.variable_scope('discrim') as dvs:
+                # if r(s)
                 rew_input = self.obs_t
+                # if r(s,a)
                 if not self.state_only:
                     rew_input = tf.concat([self.obs_t, self.act_t], axis=1)
+                ######################
+                # (1) compute r(s)/r(s,a):
+                ######################
                 with tf.variable_scope('reward'):
                     self.reward = reward_arch(rew_input, dout=1, **reward_arch_args)
                     #energy_vars = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=vs.name)
 
-                # value function shaping
+                ########################
+                # (2) value function shaping
+                ########################
+                # V(s')
                 with tf.variable_scope('vfn'):
                     fitted_value_fn_n = value_fn_arch(self.nobs_t, dout=1)
+                # V(s)
                 with tf.variable_scope('vfn', reuse=True):
                     self.value_fn = fitted_value_fn = value_fn_arch(self.obs_t, dout=1)
 
+                ######################################################
+                # (3) compute f(s,a,s')
+                #
                 # Define log p_tau(a|s) = r + gamma * V(s') - V(s)
-                self.qfn = self.reward + self.gamma*fitted_value_fn_n
-                log_p_tau = self.reward  + self.gamma*fitted_value_fn_n - fitted_value_fn
+                ######################################################
 
+                # log p_tau(a|s) likelihood of action given state
+                # self.qfn = Q(s,a) = r + \gamma * V(s')
+                # log p_tau = Q(s,a) - V(s) = A(s,a) = f(s,a,s')
+
+                # computes Q(s,a)
+                self.qfn = self.reward + self.gamma*fitted_value_fn_n
+                # computes f(s,a,s') = log p_tau
+                log_p_tau = self.reward + self.gamma*fitted_value_fn_n - fitted_value_fn
+
+            # log pi(a|s)
             log_q_tau = self.lprobs
 
+            # np.log(np.sum(np.exp(a)))
+            #x = tf.constant([[0., 0., 0.], [0., 0., 0.]])
+            # tf.reduce_logsumexp(x)  # log(6)
+            # tf.reduce_logsumexp(x, axis = 0)  # [log(2), log(2), log(2)]
             log_pq = tf.reduce_logsumexp([log_p_tau, log_q_tau], axis=0)
+
+            # computes D = e ( f/(f+pi) )
             self.discrim_output = tf.exp(log_p_tau-log_pq)
+
+            # loss = - reward = - (log D - log(1-D))
             cent_loss = -tf.reduce_mean(self.labels*(log_p_tau-log_pq) + (1-self.labels)*(log_q_tau-log_pq))
 
             self.loss = cent_loss
@@ -89,7 +118,7 @@ class AIRL(SingleTimestepIRL):
             self.step = tf.train.AdamOptimizer(learning_rate=self.lr).minimize(tot_loss)
             self._make_param_ops(_vs)
 
-    def fit(self, paths, policy=None, batch_size=32, logger=None, lr=1e-3,**kwargs):
+    def fit(self, paths, policy=None, batch_size=32, logger=None, lr=1e-3, **kwargs):
 
         if self.fusion is not None:
             old_paths = self.fusion.sample_paths(n=len(paths))
@@ -102,8 +131,12 @@ class AIRL(SingleTimestepIRL):
         # eval expert log probs under current policy
         self.eval_expert_probs(self.expert_trajs, policy, insert=True)
 
+        ################################################
+        # for given s,a provides s',a', log probability
+        ###############################################
         self._insert_next_state(paths)
         self._insert_next_state(self.expert_trajs)
+
         obs, obs_next, acts, acts_next, path_probs = \
             self.extract_paths(paths,
                                keys=('observations', 'observations_next', 'actions', 'actions_next', 'a_logprobs'))
@@ -138,6 +171,9 @@ class AIRL(SingleTimestepIRL):
                 self.lr: lr
                 }
 
+            #############################
+            # compute discriminator loss:
+            #############################
             loss, _ = tf.get_default_session().run([self.loss, self.step], feed_dict=feed_dict)
             it.record('loss', loss)
             if it.heartbeat:
@@ -182,17 +218,19 @@ class AIRL(SingleTimestepIRL):
             self._compute_path_probs(paths, insert=True)
             obs, obs_next, acts, path_probs = self.extract_paths(paths, keys=('observations', 'observations_next', 'actions', 'a_logprobs'))
             path_probs = np.expand_dims(path_probs, axis=1)
+            # computes D
             scores = tf.get_default_session().run(self.discrim_output,
                                               feed_dict={self.act_t: acts, self.obs_t: obs,
                                                          self.nobs_t: obs_next,
                                                          self.lprobs: path_probs})
+            # log (D) - log (1-D)
             score = np.log(scores) - np.log(1-scores)
-            score = score[:,0]
+            score = score[:, 0]
         else:
             obs, acts = self.extract_paths(paths)
             reward = tf.get_default_session().run(self.reward,
                                               feed_dict={self.act_t: acts, self.obs_t: obs})
-            score = reward[:,0]
+            score = reward[:, 0]
         return self.unpack(score, paths)
 
     def eval_single(self, obs):
